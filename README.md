@@ -1,5 +1,9 @@
 # Test Quad Attitude EKF Library
 
+## Explain It Simply
+
+This module is a smart guesser for attitude. It mixes gyro, accelerometer, and magnetometer information so the drone gets a smoother answer than any one sensor can give alone.
+
 This repository contains `AttitudeEKF`, the full attitude estimator used as the default filter in the flight controller. It estimates roll, pitch, yaw, and gyro bias using gyro prediction plus accelerometer and magnetometer correction.
 
 ## Pin Map

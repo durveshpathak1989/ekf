@@ -25,7 +25,7 @@
 #ifndef ATTITUDE_EKF_H
 #define ATTITUDE_EKF_H
 
-#include "AHRSCommon.h"
+#include "../AHRS/AHRSCommon.h"
 
 class AttitudeEKF {
 public:
