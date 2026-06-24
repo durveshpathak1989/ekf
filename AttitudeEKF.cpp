@@ -1,3 +1,10 @@
+/*
+ * Name: AttitudeEKF.cpp
+ * Use: Implementation of the full attitude EKF used by the flight controller.
+ * Version: 4.0.0
+ * Created by: Durvesh Pathak dp676@cornell.edu
+ */
+
 #include "AttitudeEKF.h"
 
 AttitudeEKF::AttitudeEKF()

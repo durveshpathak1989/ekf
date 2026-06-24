@@ -1,4 +1,11 @@
 /*
+ * Name: AttitudeEKF.h
+ * Use: Declaration for the full attitude EKF used by the flight controller.
+ * Version: 4.0.0
+ * Created by: Durvesh Pathak dp676@cornell.edu
+ */
+
+/*
   AttitudeEKF.h
   6-state attitude EKF for the ESP32 quadcopter flight controller.
 
