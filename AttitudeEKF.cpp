@@ -7,6 +7,8 @@
 
 #include "AttitudeEKF.h"
 
+static constexpr float EKF_GRAVITY_MPS2 = 9.80665f;
+
 AttitudeEKF::AttitudeEKF()
 {
     _angleQ = 0.0008f;       // process noise per 400 Hz update, tune from logs
@@ -24,6 +26,7 @@ void AttitudeEKF::reset()
     _roll = _pitch = _yaw = 0.0f;
     _bgx = _bgy = _bgz = 0.0f;
     _lastMagAccepted = false;
+    resetPositionVelocity();
     _lastBmpAltM = _lastTofAltM = 0.0f;
     _lastBmpValid = _lastTofValid = false;
     _lastAltTsMs = 0;
@@ -38,6 +41,11 @@ void AttitudeEKF::reset()
     _cov[3][3] = 0.10f; // gx bias uncertainty
     _cov[4][4] = 0.10f; // gy bias uncertainty
     _cov[5][5] = 0.10f; // gz bias uncertainty
+}
+
+void AttitudeEKF::resetPositionVelocity()
+{
+    _posVel = PositionVelocityEstimate();
 }
 
 void AttitudeEKF::setProcessNoise(float angleQ, float biasQ)
@@ -130,6 +138,48 @@ void AttitudeEKF::_updateScalar(int measIndex, float measurementRad, float R)
     }
 }
 
+void AttitudeEKF::_updatePositionVelocity(const AHRSInput& in, float dt)
+{
+    const float a2 = in.ax_g*in.ax_g + in.ay_g*in.ay_g + in.az_g*in.az_g;
+    if (a2 <= 1e-6f) {
+        _posVel.valid = false;
+        return;
+    }
+
+    const float cr = cosf(_roll);
+    const float sr = sinf(_roll);
+    const float cp = cosf(_pitch);
+    const float sp = sinf(_pitch);
+    const float cy = cosf(_yaw);
+    const float sy = sinf(_yaw);
+
+    // Rotate body-frame accelerometer into a local world frame:
+    // X forward/north-ish, Y right/east-ish, Z up. Accelerometer includes
+    // gravity, so subtract +1g from world Z before integrating.
+    const float axWorldG = (cy*cp) * in.ax_g
+                         + (cy*sp*sr - sy*cr) * in.ay_g
+                         + (cy*sp*cr + sy*sr) * in.az_g;
+    const float ayWorldG = (sy*cp) * in.ax_g
+                         + (sy*sp*sr + cy*cr) * in.ay_g
+                         + (sy*sp*cr - cy*sr) * in.az_g;
+    const float azWorldG = (-sp) * in.ax_g
+                         + (cp*sr) * in.ay_g
+                         + (cp*cr) * in.az_g;
+
+    _posVel.accelX_mps2 = axWorldG * EKF_GRAVITY_MPS2;
+    _posVel.accelY_mps2 = ayWorldG * EKF_GRAVITY_MPS2;
+    _posVel.accelZ_mps2 = (azWorldG - 1.0f) * EKF_GRAVITY_MPS2;
+
+    _posVel.velX_mps += _posVel.accelX_mps2 * dt;
+    _posVel.velY_mps += _posVel.accelY_mps2 * dt;
+    _posVel.velZ_mps += _posVel.accelZ_mps2 * dt;
+
+    _posVel.posX_m += _posVel.velX_mps * dt;
+    _posVel.posY_m += _posVel.velY_mps * dt;
+    _posVel.posZ_m += _posVel.velZ_mps * dt;
+    _posVel.valid = true;
+}
+
 bool AttitudeEKF::_magYawRad(const AHRSInput& in, float& yawRad) const
 {
     const float m2 = in.mx_uT*in.mx_uT + in.my_uT*in.my_uT + in.mz_uT*in.mz_uT;
@@ -200,6 +250,7 @@ bool AttitudeEKF::update(const AHRSInput& in, float dt, AttitudeEstimate& out)
     }
 
     _yaw = ahrsWrap180(_yaw * AHRS_RAD_TO_DEG) * AHRS_DEG_TO_RAD;
+    _updatePositionVelocity(in, dt);
 
     _quatFromEuler(_roll, _pitch, _yaw, out);
     out.roll_deg  = _roll  * AHRS_RAD_TO_DEG;
