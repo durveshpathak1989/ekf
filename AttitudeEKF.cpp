@@ -167,14 +167,28 @@ bool AttitudeEKF::update(const AHRSInput& in, float dt, AttitudeEstimate& out)
 
     _predictCovariance(dt);
 
-    // Measurement update 1: accelerometer gives roll and pitch when accel norm is sane.
+    // Measurement update 1: accelerometer gives roll and pitch. As accel norm
+    // moves away from 1g, increase R so transient acceleration is trusted less.
     const float a2 = in.ax_g*in.ax_g + in.ay_g*in.ay_g + in.az_g*in.az_g;
-    const bool accelUsable = (a2 > 0.64f && a2 < 1.44f); // reject high vibration/accel spikes
-    if (accelUsable) {
+    if (a2 > 1e-6f) {
+        const float accelNorm = sqrtf(a2);
+        const float accelErr = fabsf(accelNorm - 1.0f);
+
+        float activeAccelR = _accelAngleR;
+        if (accelErr < 0.10f) {
+            activeAccelR = _accelAngleR;
+        } else if (accelErr < 0.20f) {
+            activeAccelR = fmaxf(_accelAngleR, 0.15f);
+        } else if (accelErr < 0.35f) {
+            activeAccelR = fmaxf(_accelAngleR, 0.50f);
+        } else {
+            activeAccelR = 2.0f;
+        }
+
         float accRollDeg = 0.0f, accPitchDeg = 0.0f;
         ahrsAccelAnglesDeg(in.ax_g, in.ay_g, in.az_g, accRollDeg, accPitchDeg);
-        _updateScalar(0, accRollDeg  * AHRS_DEG_TO_RAD, _accelAngleR);
-        _updateScalar(1, accPitchDeg * AHRS_DEG_TO_RAD, _accelAngleR);
+        _updateScalar(0, accRollDeg  * AHRS_DEG_TO_RAD, activeAccelR);
+        _updateScalar(1, accPitchDeg * AHRS_DEG_TO_RAD, activeAccelR);
     }
 
     // Measurement update 2: magnetometer gives absolute yaw, correcting yaw drift.
