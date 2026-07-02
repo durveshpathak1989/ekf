@@ -9,6 +9,13 @@
 
 static constexpr float EKF_GRAVITY_MPS2 = 9.80665f;
 
+static float ekfClampFloat(float v, float lo, float hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
 AttitudeEKF::AttitudeEKF()
 {
     _angleQ = 0.0008f;       // process noise per 400 Hz update, tune from logs
@@ -18,6 +25,9 @@ AttitudeEKF::AttitudeEKF()
     _declinationRad = 0.0f;  // set local declination later if you want true north
     _magYawOffsetRad = 0.0f; // set after bench heading test if needed
     _magYawSign = 1.0f;      // change to -1 if yaw correction moves the wrong way
+    _altAccelQ = 0.35f;      // vertical accel/process uncertainty
+    _baroAltR = 1.25f;       // BMP280 is broad/noisy but long-range
+    _tofAltR = 0.025f;       // VL53L4CX is strong close to ground
     reset();
 }
 
@@ -46,6 +56,16 @@ void AttitudeEKF::reset()
 void AttitudeEKF::resetPositionVelocity()
 {
     _posVel = PositionVelocityEstimate();
+    _altZ = 0.0f;
+    _altVz = 0.0f;
+    _altP00 = 4.0f;
+    _altP01 = 0.0f;
+    _altP10 = 0.0f;
+    _altP11 = 1.0f;
+    _baroRefAltM = 0.0f;
+    _altValid = false;
+    _baroRefValid = false;
+    _altLastUpdateMs = 0;
 }
 
 void AttitudeEKF::setProcessNoise(float angleQ, float biasQ)
@@ -77,6 +97,13 @@ void AttitudeEKF::setMagYawOffsetDeg(float offsetDeg)
 void AttitudeEKF::setMagYawSign(float sign)
 {
     _magYawSign = (sign < 0.0f) ? -1.0f : 1.0f;
+}
+
+void AttitudeEKF::setAltitudeEstimatorNoise(float accelQ, float baroAltR, float tofAltR)
+{
+    _altAccelQ = ekfClampFloat(accelQ, 0.0001f, 20.0f);
+    _baroAltR = ekfClampFloat(baroAltR, 0.001f, 100.0f);
+    _tofAltR = ekfClampFloat(tofAltR, 0.0001f, 10.0f);
 }
 
 void AttitudeEKF::_predictCovariance(float dt)
@@ -172,12 +199,67 @@ void AttitudeEKF::_updatePositionVelocity(const AHRSInput& in, float dt)
 
     _posVel.velX_mps += _posVel.accelX_mps2 * dt;
     _posVel.velY_mps += _posVel.accelY_mps2 * dt;
-    _posVel.velZ_mps += _posVel.accelZ_mps2 * dt;
+    if (!_altValid) {
+        _posVel.velZ_mps += _posVel.accelZ_mps2 * dt;
+        _posVel.posZ_m += _posVel.velZ_mps * dt;
+    }
 
     _posVel.posX_m += _posVel.velX_mps * dt;
     _posVel.posY_m += _posVel.velY_mps * dt;
-    _posVel.posZ_m += _posVel.velZ_mps * dt;
     _posVel.valid = true;
+}
+
+void AttitudeEKF::_predictAltitude(float dt)
+{
+    const float az = _posVel.accelZ_mps2;
+
+    _altZ += _altVz * dt + 0.5f * az * dt * dt;
+    _altVz += az * dt;
+
+    const float dt2 = dt * dt;
+    const float dt3 = dt2 * dt;
+    const float dt4 = dt2 * dt2;
+
+    const float q00 = 0.25f * dt4 * _altAccelQ;
+    const float q01 = 0.5f * dt3 * _altAccelQ;
+    const float q10 = q01;
+    const float q11 = dt2 * _altAccelQ;
+
+    const float p00 = _altP00 + dt * (_altP10 + _altP01) + dt2 * _altP11 + q00;
+    const float p01 = _altP01 + dt * _altP11 + q01;
+    const float p10 = _altP10 + dt * _altP11 + q10;
+    const float p11 = _altP11 + q11;
+
+    _altP00 = p00;
+    _altP01 = p01;
+    _altP10 = p10;
+    _altP11 = p11;
+}
+
+void AttitudeEKF::_updateAltitudeScalar(float measurementM, float R)
+{
+    const float S = _altP00 + R;
+    if (S <= 1e-9f) return;
+
+    const float innovation = measurementM - _altZ;
+    const float k0 = _altP00 / S;
+    const float k1 = _altP10 / S;
+
+    _altZ += k0 * innovation;
+    _altVz += k1 * innovation;
+
+    const float p00 = _altP00;
+    const float p01 = _altP01;
+    const float p10 = _altP10;
+    const float p11 = _altP11;
+
+    _altP00 = p00 - k0 * p00;
+    _altP01 = p01 - k0 * p01;
+    _altP10 = p10 - k1 * p00;
+    _altP11 = p11 - k1 * p01;
+
+    if (_altP00 < 1e-6f) _altP00 = 1e-6f;
+    if (_altP11 < 1e-6f) _altP11 = 1e-6f;
 }
 
 bool AttitudeEKF::_magYawRad(const AHRSInput& in, float& yawRad) const
@@ -262,11 +344,67 @@ bool AttitudeEKF::update(const AHRSInput& in, float dt, AttitudeEstimate& out)
 void AttitudeEKF::updateAltitudeSensors(float bmpAltM, bool bmpValid,
                                         float tofAltM, bool tofValid, uint32_t tsMs)
 {
+    const bool haveMeasurement = bmpValid || tofValid;
+    if (_altValid && _altLastUpdateMs != 0 && tsMs > _altLastUpdateMs) {
+        const float dt = (float)(tsMs - _altLastUpdateMs) * 0.001f;
+        if (dt > 0.0f && dt < 1.0f) {
+            _predictAltitude(dt);
+        }
+    }
+
+    if (!haveMeasurement) {
+        if (_altValid) {
+            _posVel.posZ_m = _altZ;
+            _posVel.velZ_mps = _altVz;
+            _posVel.altitudeValid = true;
+            _posVel.valid = true;
+            _altLastUpdateMs = tsMs;
+        }
+        _lastBmpAltM = bmpAltM;
+        _lastTofAltM = tofAltM;
+        _lastBmpValid = false;
+        _lastTofValid = false;
+        return;
+    }
+
+    if (!_altValid) {
+        if (tofValid) {
+            _altZ = tofAltM;
+            _altVz = 0.0f;
+        } else {
+            _altZ = 0.0f;
+            _altVz = 0.0f;
+        }
+        _altP00 = tofValid ? _tofAltR : _baroAltR;
+        _altP01 = 0.0f;
+        _altP10 = 0.0f;
+        _altP11 = 1.0f;
+        _altValid = true;
+    }
+
+    if (bmpValid && !_baroRefValid) {
+        _baroRefAltM = bmpAltM - _altZ;
+        _baroRefValid = true;
+    }
+
+    if (bmpValid && _baroRefValid) {
+        _updateAltitudeScalar(bmpAltM - _baroRefAltM, _baroAltR);
+    }
+    if (tofValid) {
+        _updateAltitudeScalar(tofAltM, _tofAltR);
+    }
+
+    _posVel.posZ_m = _altZ;
+    _posVel.velZ_mps = _altVz;
+    _posVel.altitudeValid = _altValid;
+    _posVel.valid = true;
+
     _lastBmpAltM = bmpAltM;
     _lastTofAltM = tofAltM;
     _lastBmpValid = bmpValid;
     _lastTofValid = tofValid;
     _lastAltTsMs = tsMs;
+    _altLastUpdateMs = tsMs;
 }
 
 void AttitudeEKF::_quatFromEuler(float roll, float pitch, float yaw, AttitudeEstimate& out)
